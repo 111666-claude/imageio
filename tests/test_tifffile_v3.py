@@ -1,6 +1,7 @@
 """Test tifffile plugin functionality."""
 
 import datetime
+import functools
 import numpy as np
 import pytest
 import io
@@ -474,3 +475,186 @@ def test_iter_pages(tmp_path):
     with iio.imopen(filename, "r") as file:
         for idx, page in enumerate(file.iter_pages(index=1)):
             np.testing.assert_allclose(page, volumetric[idx])
+
+
+@pytest.fixture()
+def region_image():
+    rng = np.random.default_rng(42)
+    return rng.integers(0, 255, (517, 803, 3), np.uint8)
+
+
+def test_region_read_tiled(tmp_path, region_image):
+    filename = tmp_path / "tiled.tiff"
+    iio.imwrite(filename, region_image, tile=(128, 128))
+
+    full = iio.imread(filename)
+    for region in [
+        (0, 0, 517, 803),  # full image
+        (300, 500, 517, 803),  # bottom-right corner (partial edge tiles)
+        (0, 0, 1, 1),  # single pixel
+        (128, 128, 256, 256),  # exactly one tile
+        (100, 100, 101, 101),  # 1x1 inside a tile
+        (64, 64, 700, 900),  # clipped to bounds
+        (-100, -50, 10**6, 10**6),  # negative + out-of-bounds
+    ]:
+        y0, x0, y1, x1 = region
+        y0 = y0 + 517 if y0 < 0 else y0
+        x0 = x0 + 803 if x0 < 0 else x0
+        expected = full[max(y0, 0) : min(y1, 517), max(x0, 0) : min(x1, 803)]
+        actual = iio.imread(filename, region=region)
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_region_read_strips(tmp_path, region_image):
+    filename = tmp_path / "strips.tiff"
+    iio.imwrite(filename, region_image, rowsperstrip=37)
+
+    full = iio.imread(filename)
+    actual = iio.imread(filename, region=(50, 60, 510, 800))
+    np.testing.assert_array_equal(actual, full[50:510, 60:800])
+
+
+def test_region_read_compressed(tmp_path, region_image):
+    filename = tmp_path / "compressed.tiff"
+    iio.imwrite(
+        filename, region_image, tile=(128, 128), compression="deflate", predictor=2
+    )
+
+    full = iio.imread(filename)
+    actual = iio.imread(filename, region=(33, 65, 500, 800))
+    np.testing.assert_array_equal(actual, full[33:500, 65:800])
+
+
+def test_region_read_jpeg(tmp_path, region_image):
+    pytest.importorskip("imagecodecs")
+    filename = tmp_path / "jpeg.tiff"
+    iio.imwrite(filename, region_image, tile=(256, 256), compression="jpeg")
+
+    full = iio.imread(filename)
+    actual = iio.imread(filename, region=(100, 200, 400, 700))
+    np.testing.assert_array_equal(actual, full[100:400, 200:700])
+
+
+def test_region_read_single_strip_fallback(tmp_path, region_image):
+    # a single strip spans the whole image and cannot be decoded partially;
+    # the region read must still be pixel-identical to slicing a full read
+    filename = tmp_path / "single_strip.tiff"
+    iio.imwrite(filename, region_image)
+
+    full = iio.imread(filename)
+    actual = iio.imread(filename, region=(10, 20, 500, 800))
+    np.testing.assert_array_equal(actual, full[10:500, 20:800])
+
+
+def test_region_read_multipage(tmp_path):
+    rng = np.random.default_rng(13)
+    pages = [rng.integers(0, 255, (200, 300), np.uint8) for _ in range(3)]
+
+    filename = tmp_path / "multipage.tiff"
+    iio.imwrite(filename, pages, is_batch=True, contiguous=True, rowsperstrip=48)
+
+    region = (10, 20, 100, 200)
+    y0, x0, y1, x1 = region
+
+    # individual pages of the series
+    for i, page in enumerate(pages):
+        actual = iio.imread(filename, page=i, region=region)
+        np.testing.assert_array_equal(actual, page[y0:y1, x0:x1])
+
+    # the whole series
+    actual = iio.imread(filename, index=0, region=region)
+    np.testing.assert_array_equal(actual, np.stack(pages)[:, y0:y1, x0:x1])
+
+    # all series as a batch
+    actual = iio.imread(filename, index=..., region=region)
+    full_batch = iio.imread(filename, index=...)
+    np.testing.assert_array_equal(actual, full_batch[:, :, y0:y1, x0:x1])
+
+    # flat page index
+    actual = iio.imread(filename, index=..., page=2, region=region)
+    np.testing.assert_array_equal(actual, pages[2][y0:y1, x0:x1])
+
+
+def test_region_read_planar(tmp_path, region_image):
+    filename = tmp_path / "planar.tiff"
+    tifffile.imwrite(
+        filename,
+        np.moveaxis(region_image, -1, 0),
+        planarconfig="separate",
+        photometric="rgb",
+        rowsperstrip=100,
+    )
+
+    full = iio.imread(filename)  # shape (samples, Y, X)
+    actual = iio.imread(filename, region=(30, 40, 500, 700))
+    np.testing.assert_array_equal(actual, full[:, 30:500, 40:700])
+
+
+def test_region_read_uint16(tmp_path):
+    rng = np.random.default_rng(7)
+    image = rng.integers(0, 65535, (300, 300), np.uint16)
+
+    filename = tmp_path / "uint16.tiff"
+    iio.imwrite(filename, image, tile=(64, 64))
+
+    actual = iio.imread(filename, region=(33, 65, 299, 299))
+    np.testing.assert_array_equal(actual, image[33:299, 65:299])
+
+
+def test_region_read_empty_raises(tmp_path, region_image):
+    filename = tmp_path / "tiled.tiff"
+    iio.imwrite(filename, region_image, tile=(128, 128))
+
+    with pytest.raises(ValueError, match="empty"):
+        iio.imread(filename, region=(10, 10, 5, 20))
+
+    with pytest.raises(ValueError, match="empty"):
+        # fully outside the image
+        iio.imread(filename, region=(10**6, 0, 10**7, 10))
+
+    with pytest.raises(ValueError, match="4 ints"):
+        iio.imread(filename, region=(0, 0, 10))
+
+
+def test_region_read_conflicting_kwargs(tmp_path, region_image):
+    filename = tmp_path / "tiled.tiff"
+    iio.imwrite(filename, region_image, tile=(128, 128))
+
+    with pytest.raises(ValueError, match="region"):
+        iio.imread(filename, region=(0, 0, 10, 10), key=0)
+
+    with pytest.raises(ValueError, match="region"):
+        iio.imread(filename, region=(0, 0, 10, 10), series=0)
+
+
+def test_region_read_io_scales_with_region(tmp_path, monkeypatch):
+    # On chunked files, a small region read must only read the intersecting
+    # tiles from disk, not the whole page.
+    rng = np.random.default_rng(5)
+    image = rng.integers(0, 255, (2048, 2048), np.uint8)
+
+    filename = tmp_path / "big_tiled.tiff"
+    iio.imwrite(filename, image, tile=(256, 256), compression="deflate")
+
+    bytes_read = 0
+    original_read_segments = tifffile.FileHandle.read_segments
+
+    @functools.wraps(original_read_segments)
+    def counting_read_segments(self, offsets, bytecounts, /, *args, **kwargs):
+        nonlocal bytes_read
+        bytes_read += sum(bytecounts)
+        yield from original_read_segments(self, offsets, bytecounts, *args, **kwargs)
+
+    monkeypatch.setattr(tifffile.FileHandle, "read_segments", counting_read_segments)
+
+    iio.imread(filename)
+    full_bytes = bytes_read
+
+    bytes_read = 0
+    region = iio.imread(filename, region=(1024, 1024, 1280, 1280))
+    region_bytes = bytes_read
+
+    np.testing.assert_array_equal(region, image[1024:1280, 1024:1280])
+    # the 256x256 region covers 1/64 of the image and intersects exactly
+    # one 256x256 tile; allow generous slack for tag/IFD re-reads
+    assert region_bytes < full_bytes // 8
