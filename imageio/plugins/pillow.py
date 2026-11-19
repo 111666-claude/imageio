@@ -25,11 +25,15 @@ Methods
     PillowPlugin.write
     PillowPlugin.iter
     PillowPlugin.get_meta
+    PillowPlugin.read_at
+    PillowPlugin.animation_duration
+    PillowPlugin.animation_timeline
 
 """
 
 import sys
 import warnings
+from collections import OrderedDict
 from io import BytesIO
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, cast
 
@@ -37,6 +41,7 @@ import numpy as np
 from PIL import ExifTags, GifImagePlugin, Image, ImageSequence, UnidentifiedImageError
 from PIL import __version__ as pil_version  # type: ignore
 
+from ..core.animation import AnimationTimeline
 from ..core.request import URI_BYTES, InitializationError, IOMode, Request
 from ..core.v3_plugin_api import ImageProperties, PluginV3
 from ..typing import ArrayLike
@@ -101,6 +106,12 @@ class PillowPlugin(PluginV3):
         self._image: Image = None
         self.images_to_write = []
 
+        # animation time view state (see `read_at`)
+        self._timeline: Optional[AnimationTimeline] = None
+        self._frame_cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
+        self._frame_cache_bytes = 0
+        self.max_frame_cache_bytes = 256 * 1024**2
+
         if request.mode.io_mode == IOMode.read:
             try:
                 # Check if it is generally possible to read the image.
@@ -146,6 +157,9 @@ class PillowPlugin(PluginV3):
 
         if self._image:
             self._image.close()
+
+        self._frame_cache.clear()
+        self._frame_cache_bytes = 0
 
         self._request.finish()
 
@@ -298,6 +312,158 @@ class PillowPlugin(PluginV3):
             yield self._apply_transforms(
                 im, mode, rotate, apply_gamma, writeable_output
             )
+
+    def animation_timeline(self) -> AnimationTimeline:
+        """The timeline of the animation in the ImageResource.
+
+        Returns
+        -------
+        timeline : AnimationTimeline
+            An object describing how playback time (in milliseconds) maps
+            onto the frames of the animation. See
+            :class:`imageio.core.animation.AnimationTimeline` for details.
+
+        Notes
+        -----
+        The timeline is built by scanning the animation once and is cached
+        afterwards. Frames that cannot be decoded (e.g. because the file is
+        truncated or corrupt) abort the scan with a ``UserWarning``; the
+        animation is then treated as if it ends before the broken frame.
+
+        """
+        if self._timeline is None:
+            self._timeline = self._build_animation_timeline()
+        return self._timeline
+
+    def animation_duration(self) -> float:
+        """The total duration of the animation in milliseconds.
+
+        This is the duration of a single play-through, i.e. the sum of the
+        per-frame delays. For static (non-animated) images it is 0. Use
+        :meth:`read_at` to read the composed canvas frame at a given
+        playback time.
+
+        Returns
+        -------
+        duration : float
+            The duration of one play-through in milliseconds.
+
+        """
+        return self.animation_timeline().duration
+
+    def read_at(self, time_ms: float, *, loop: bool = False) -> np.ndarray:
+        """Read the composed canvas frame shown at the given playback time.
+
+        This provides a time-based view of animated ImageResources (e.g.
+        GIF or APNG): instead of addressing frames by index, frames are
+        addressed by their playback time in milliseconds. The returned
+        image is the full canvas in RGBA with per-frame delays, partial
+        (smaller than canvas) frames, transparency, and frame disposal
+        applied, i.e. it matches what a viewer would display at that
+        moment. Random access is pixel-identical to sequential playback.
+
+        Parameters
+        ----------
+        time_ms : float
+            The playback time in milliseconds. Without looping, valid times
+            lie in ``[0, duration]`` where ``duration`` is
+            :meth:`animation_duration`. The exact end of a play-through
+            shows the animation's end state.
+        loop : bool
+            If True, the animation loops and times outside one play-through
+            wrap around via modulo. If False (default), out-of-range times
+            raise an ``IndexError``.
+
+        Returns
+        -------
+        ndimage : np.ndarray
+            The composed canvas at ``time_ms`` as an RGBA array of shape
+            ``(height, width, 4)``.
+
+        Raises
+        ------
+        IndexError
+            If the animation contains no (decodable) frames, or if
+            ``time_ms`` lies outside the animation and ``loop`` is False.
+        ValueError
+            If ``time_ms`` is not a finite number.
+        IOError
+            If the frame at the requested time cannot be decoded.
+
+        Notes
+        -----
+        Frames with a delay of 0 ms occupy no playback time and are skipped
+        during playback (they still contribute to compositing). A static
+        image behaves like an animation with zero duration: only
+        ``time_ms=0`` is valid and returns the image itself.
+
+        Composed frames are cached to speed up random access. The cache is
+        bounded by ``self.max_frame_cache_bytes`` (default 256 MiB) and
+        evicts least-recently-used frames when full; frames larger than the
+        budget are served without being cached. Set it to 0 to disable
+        caching.
+
+        """
+        timeline = self.animation_timeline()
+        index = timeline.frame_index_at(time_ms, loop=loop)
+        return self._composed_frame_at(index)
+
+    def _build_animation_timeline(self) -> AnimationTimeline:
+        delays: List[float] = []
+        n_frames = getattr(self._image, "n_frames", 1)
+
+        for index in range(n_frames):
+            try:
+                # decode (and cache) each frame to make sure it is intact
+                self._decode_frame(index)
+            except Exception as err:
+                warnings.warn(
+                    f"Could not decode frame {index} while scanning the"
+                    f" animation ({err!r}). The animation is treated as"
+                    " ending before this frame.",
+                    UserWarning,
+                )
+                break
+            delays.append(self._image.info.get("duration") or 0)
+
+        return AnimationTimeline(delays)
+
+    def _composed_frame_at(self, index: int) -> np.ndarray:
+        cached = self._frame_cache.get(index)
+        if cached is not None:
+            self._frame_cache.move_to_end(index)
+            return cached.copy()
+        return self._decode_frame(index)
+
+    def _decode_frame(self, index: int) -> np.ndarray:
+        # Seeking composes the frame onto the canvas (applying partial
+        # updates, transparency, and disposal of previous frames). Pillow
+        # rewinds and replays the animation internally when needed, so the
+        # result is identical to sequential playback.
+        try:
+            self._image.seek(index)
+            frame = np.asarray(self._image.convert("RGBA"))
+        except Exception as err:
+            raise IOError(f"Could not decode frame {index} of the animation.") from err
+
+        if not frame.flags["WRITEABLE"]:
+            frame = np.array(frame)
+
+        self._cache_frame(index, frame)
+        return frame
+
+    def _cache_frame(self, index: int, frame: np.ndarray) -> None:
+        capacity = self.max_frame_cache_bytes
+        if capacity <= 0 or frame.nbytes > capacity:
+            # caching disabled, or a single frame exceeds the budget:
+            # serve the frame without caching it
+            return
+
+        self._frame_cache[index] = frame
+        self._frame_cache_bytes += frame.nbytes
+        while self._frame_cache_bytes > capacity:
+            _, evicted = self._frame_cache.popitem(last=False)
+            self._frame_cache_bytes -= evicted.nbytes
 
     def _apply_transforms(
         self, image, mode, rotate, apply_gamma, writeable_output

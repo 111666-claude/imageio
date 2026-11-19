@@ -788,3 +788,245 @@ def test_pillow_readline_on_seekable_stream():
     img = iio.imread(SeekableFileObject(io.BytesIO(xpm)), plugin="pillow")
     assert img.shape == (1, 1, 3)
     assert np.array_equal(img[0, 0], [255, 0, 0])
+
+
+def _write_partial_gif(path, durations=(100, 200, 50)):
+    """Write a 3-frame animation with partial frames, transparency, disposal.
+
+    Canvas 8x6. Frame 0 is fully red. Frame 1 paints a blue rectangle over
+    x in [2, 6), y in [1, 5) and is kept on the canvas (disposal=1). Frame 2
+    paints a green rectangle over x in [4, 6), y in [3, 5) with a
+    transparent hole at (4, 3) that reveals frame 1's blue (disposal=2).
+    Pillow's encoder stores frames 1 and 2 as partial (offset) frames.
+    """
+    f0 = Image.new("RGBA", (8, 6), (255, 0, 0, 255))
+    f1 = f0.copy()
+    for y in range(1, 5):
+        for x in range(2, 6):
+            f1.putpixel((x, y), (0, 0, 255, 255))
+    f2 = f1.copy()
+    for y in range(3, 5):
+        for x in range(4, 6):
+            f2.putpixel((x, y), (0, 255, 0, 255))
+    f2.putpixel((4, 3), (0, 0, 0, 0))  # transparent hole
+
+    f0.save(
+        path,
+        save_all=True,
+        append_images=[f1, f2],
+        duration=list(durations),
+        loop=0,
+        disposal=[0, 1, 2],
+    )
+
+
+def _expected_partial_gif_frames():
+    exp0 = np.zeros((6, 8, 4), dtype=np.uint8)
+    exp0[..., 0] = 255
+    exp0[..., 3] = 255
+
+    exp1 = exp0.copy()
+    exp1[1:5, 2:6] = (0, 0, 255, 255)
+
+    exp2 = exp1.copy()
+    exp2[3:5, 4:6] = (0, 255, 0, 255)
+    exp2[3, 4] = (0, 0, 255, 255)  # transparent hole reveals frame 1
+
+    return [exp0, exp1, exp2]
+
+
+def test_gif_animation_duration(tmp_path):
+    _write_partial_gif(tmp_path / "anim.gif")
+
+    with iio.imopen(tmp_path / "anim.gif", "r", plugin="pillow") as f:
+        assert f.animation_duration() == 350
+
+        timeline = f.animation_timeline()
+        assert timeline.n_frames == 3
+        assert timeline.delays == [100, 200, 50]
+        assert timeline.starts == [0, 100, 300]
+
+
+def test_gif_read_at_boundary_times(tmp_path):
+    _write_partial_gif(tmp_path / "anim.gif")
+    exp0, exp1, exp2 = _expected_partial_gif_frames()
+
+    with iio.imopen(tmp_path / "anim.gif", "r", plugin="pillow") as f:
+        # half-open intervals: a boundary belongs to the frame starting there
+        assert np.array_equal(f.read_at(0), exp0)
+        assert np.array_equal(f.read_at(99.9), exp0)
+        assert np.array_equal(f.read_at(100), exp1)
+        assert np.array_equal(f.read_at(299.9), exp1)
+        assert np.array_equal(f.read_at(300), exp2)
+        assert np.array_equal(f.read_at(349.9), exp2)
+        # the exact end of a play-through shows the end state
+        assert np.array_equal(f.read_at(350), exp2)
+
+
+def test_gif_read_at_composed_pixels(tmp_path):
+    # partial updates, transparency and disposal applied to the canvas
+    _write_partial_gif(tmp_path / "anim.gif")
+
+    with iio.imopen(tmp_path / "anim.gif", "r", plugin="pillow") as f:
+        frame = f.read_at(300)
+        assert frame.shape == (6, 8, 4)
+        # untouched background
+        assert np.array_equal(frame[0, 0], [255, 0, 0, 255])
+        # frame 1's rectangle survived (disposal=1 / do not dispose)
+        assert np.array_equal(frame[1, 2], [0, 0, 255, 255])
+        # frame 2's partial update
+        assert np.array_equal(frame[4, 5], [0, 255, 0, 255])
+        # transparent hole in frame 2 reveals frame 1
+        assert np.array_equal(frame[3, 4], [0, 0, 255, 255])
+
+
+def test_gif_read_at_random_access_matches_sequential(tmp_path):
+    _write_partial_gif(tmp_path / "anim.gif")
+
+    with iio.imopen(tmp_path / "anim.gif", "r", plugin="pillow") as f:
+        sequential = [f.read_at(t) for t in (0, 100, 150, 300, 349)]
+
+    with iio.imopen(tmp_path / "anim.gif", "r", plugin="pillow") as f:
+        shuffled = {t: f.read_at(t) for t in (349, 0, 300, 100, 150, 0, 349)}
+
+    for t, expected in zip((0, 100, 150, 300, 349), sequential):
+        assert np.array_equal(shuffled[t], expected)
+
+
+def test_gif_read_at_loop_and_out_of_range(tmp_path):
+    _write_partial_gif(tmp_path / "anim.gif")
+    exp0, exp1, exp2 = _expected_partial_gif_frames()
+
+    with iio.imopen(tmp_path / "anim.gif", "r", plugin="pillow") as f:
+        # single play-through: times outside [0, 350] are rejected
+        with pytest.raises(IndexError):
+            f.read_at(350.1)
+        with pytest.raises(IndexError):
+            f.read_at(-0.1)
+        with pytest.raises(ValueError):
+            f.read_at(np.nan)
+
+        # looping wraps around
+        assert np.array_equal(f.read_at(350, loop=True), exp0)
+        assert np.array_equal(f.read_at(450, loop=True), exp1)
+        assert np.array_equal(f.read_at(649.9, loop=True), exp1)
+        assert np.array_equal(f.read_at(650, loop=True), exp2)
+        assert np.array_equal(f.read_at(-1, loop=True), exp2)
+
+
+def test_apng_animation_time_view(tmp_path):
+    f0 = Image.new("RGBA", (8, 6), (255, 0, 0, 255))
+    f1 = Image.new("RGBA", (8, 6), (0, 0, 255, 255))
+    f2 = f1.copy()
+    for y in range(3, 5):
+        for x in range(4, 6):
+            f2.putpixel((x, y), (0, 255, 0, 255))
+    f0.save(
+        tmp_path / "anim.apng",
+        save_all=True,
+        append_images=[f1, f2],
+        duration=[100, 200, 50],
+        loop=0,
+    )
+
+    with iio.imopen(tmp_path / "anim.apng", "r", plugin="pillow") as f:
+        assert f.animation_duration() == 350
+
+        frame = f.read_at(300)
+        assert np.array_equal(frame[0, 0], [0, 0, 255, 255])
+        assert np.array_equal(frame[4, 5], [0, 255, 0, 255])
+
+        # random access matches sequential playback
+        assert np.array_equal(f.read_at(150), f.read_at(150))
+        assert np.array_equal(f.read_at(50)[0, 0], [255, 0, 0, 255])
+
+
+def test_read_at_zero_delay_gif(tmp_path):
+    # zero-delay frames occupy no playback time and are skipped
+    _write_partial_gif(tmp_path / "anim.gif", durations=(0, 100, 50))
+
+    with iio.imopen(tmp_path / "anim.gif", "r", plugin="pillow") as f:
+        assert f.animation_duration() == 150
+
+        exp0, exp1, exp2 = _expected_partial_gif_frames()
+        # frame 0 has zero display time; t=0 already shows frame 1
+        assert np.array_equal(f.read_at(0), exp1)
+        assert np.array_equal(f.read_at(99.9), exp1)
+        assert np.array_equal(f.read_at(100), exp2)
+
+
+def test_read_at_static_image(tmp_path):
+    # static images behave like a zero-duration animation ...
+    iio.imwrite(tmp_path / "static.png", np.full((4, 4, 3), 7, np.uint8))
+
+    with iio.imopen(tmp_path / "static.png", "r", plugin="pillow") as f:
+        assert f.animation_duration() == 0
+
+        frame = f.read_at(0)
+        assert frame.shape == (4, 4, 4)
+        assert np.array_equal(frame[0, 0], [7, 7, 7, 255])
+
+        with pytest.raises(IndexError):
+            f.read_at(1)
+
+        # ... and index-based reading is unaffected
+        assert f.read(index=0).shape == (4, 4, 3)
+
+
+def test_read_at_corrupt_gif(tmp_path):
+    _write_partial_gif(tmp_path / "anim.gif")
+    data = (tmp_path / "anim.gif").read_bytes()
+    # truncate inside the second frame's data
+    (tmp_path / "corrupt.gif").write_bytes(data[:112])
+
+    with iio.imopen(tmp_path / "corrupt.gif", "r", plugin="pillow") as f:
+        # the scan stops at the broken frame with a warning ...
+        with pytest.warns(UserWarning, match="Could not decode frame 1"):
+            duration = f.animation_duration()
+
+        # ... and the animation is treated as ending before it
+        assert duration == 100
+        exp0, _, _ = _expected_partial_gif_frames()
+        assert np.array_equal(f.read_at(50), exp0)
+
+        with pytest.raises(IndexError):
+            f.read_at(150)
+
+
+def test_read_at_cache_limit(tmp_path):
+    _write_partial_gif(tmp_path / "anim.gif")
+    exp0, exp1, exp2 = _expected_partial_gif_frames()
+
+    with iio.imopen(tmp_path / "anim.gif", "r", plugin="pillow") as f:
+        # each composed frame is 6*8*4 = 192 bytes; allow only one
+        f.max_frame_cache_bytes = 192
+        assert np.array_equal(f.read_at(0), exp0)
+        assert np.array_equal(f.read_at(300), exp2)
+        assert np.array_equal(f.read_at(100), exp1)
+        # the cache stays within budget (LRU eviction)
+        assert len(f._frame_cache) <= 1
+        assert f._frame_cache_bytes <= 192
+        # results are still correct after evictions
+        assert np.array_equal(f.read_at(0), exp0)
+
+    with iio.imopen(tmp_path / "anim.gif", "r", plugin="pillow") as f:
+        # a frame larger than the budget is served without caching
+        f.max_frame_cache_bytes = 10
+        assert np.array_equal(f.read_at(0), exp0)
+        assert len(f._frame_cache) == 0
+
+    with iio.imopen(tmp_path / "anim.gif", "r", plugin="pillow") as f:
+        # caching can be disabled entirely
+        f.max_frame_cache_bytes = 0
+        assert np.array_equal(f.read_at(300), exp2)
+        assert len(f._frame_cache) == 0
+
+
+def test_read_at_cached_result_is_a_copy(tmp_path):
+    _write_partial_gif(tmp_path / "anim.gif")
+    exp0, _, _ = _expected_partial_gif_frames()
+
+    with iio.imopen(tmp_path / "anim.gif", "r", plugin="pillow") as f:
+        frame = f.read_at(0)
+        frame[:] = 0  # mutating the result must not corrupt the cache
+        assert np.array_equal(f.read_at(0), exp0)
